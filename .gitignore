@@ -1,0 +1,6 @@
+.history/
+__pycache__
+.yapf
+.vscode/              # vscode 配置文件夹
+desktop.ini
+.*/                   # 所有 .开头的文件夹
