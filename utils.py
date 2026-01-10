@@ -7,36 +7,472 @@ from mathutils import Vector
 import colorsys
 from ctypes import c_void_p, c_float
 from math import pi, sqrt, exp, hypot, sin, cos
+import re
+
+# Socket类型到色相偏移的映射（基于HSV色相，范围0-360度）
+SOCKET_TYPE_HUE_OFFSETS = {
+    'NodeSocketFloat': 0.0,        # 灰色，无偏移
+    'NodeSocketInt': 15.0,         # 绿色偏黄
+    'NodeSocketVector': -60.0,     # 蓝色
+    'NodeSocketColor': 30.0,       # 黄色
+    'NodeSocketShader': 120.0,     # 绿色
+    'NodeSocketBool': 300.0,       # 紫色
+    'NodeSocketString': 200.0,     # 青色
+    'NodeSocketObject': 20.0,      # 橙黄色
+    'NodeSocketImage': 270.0,      # 粉紫色
+    'NodeSocketGeometry': 150.0,   # 青绿色
+    'NodeSocketCollection': 0.0,   # 白色，无偏移
+    'NodeSocketTexture': 60.0,     # 黄色偏橙
+    'NodeSocketMaterial': 350.0,   # 红紫色
+    'NodeSocketRotation': 240.0,   # 蓝紫色
+    'NodeSocketMenu': 0.0,         # 灰色，无偏移
+    'NodeSocketMatrix': 330.0,     # 红紫色
+    'NodeSocketClosure': 90.0,     # 黄绿色
+}
+
+def get_socket_type_name(socket):
+    """获取socket的类型名称"""
+    if hasattr(socket, 'bl_idname'):
+        return socket.bl_idname
+    elif hasattr(socket, 'type'):
+        # 兼容性：如果只有type属性，尝试转换
+        type_map = {
+            'VALUE': 'NodeSocketFloat',
+            'INT': 'NodeSocketInt',
+            'VECTOR': 'NodeSocketVector',
+            'RGBA': 'NodeSocketColor',
+            'SHADER': 'NodeSocketShader',
+            'BOOLEAN': 'NodeSocketBool',
+            'STRING': 'NodeSocketString',
+            'OBJECT': 'NodeSocketObject',
+            'IMAGE': 'NodeSocketImage',
+            'GEOMETRY': 'NodeSocketGeometry',
+            'COLLECTION': 'NodeSocketCollection',
+            'TEXTURE': 'NodeSocketTexture',
+            'MATERIAL': 'NodeSocketMaterial',
+            'ROTATION': 'NodeSocketRotation',
+            'MENU': 'NodeSocketMenu',
+            'MATRIX': 'NodeSocketMatrix',
+        }
+        return type_map.get(socket.type, 'NodeSocketFloat')
+    return 'NodeSocketFloat'  # 默认
+
+def shift_hue(rgb, hue_offset):
+    """
+    对RGB颜色进行HSV色相偏移
+    rgb: (r, g, b) 或 (r, g, b, a)，值范围0-1
+    hue_offset: 色相偏移角度（度），范围-180到180
+    返回: (r, g, b, a) 格式的颜色
+    """
+    if len(rgb) >= 3:
+        r, g, b = rgb[0], rgb[1], rgb[2]
+        alpha = rgb[3] if len(rgb) >= 4 else 1.0
+    else:
+        return rgb
+    
+    # 转换为HSV
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    
+    # 偏移色相（转换为0-1范围）
+    h_offset_normalized = hue_offset / 360.0
+    h_new = (h + h_offset_normalized) % 1.0
+    
+    # 转回RGB
+    r_new, g_new, b_new = colorsys.hsv_to_rgb(h_new, s, v)
+    
+    return (r_new, g_new, b_new, alpha)
+
+def get_socket_hue_offset(socket):
+    """获取socket类型的色相偏移值"""
+    socket_type = get_socket_type_name(socket)
+    return SOCKET_TYPE_HUE_OFFSETS.get(socket_type, 0.0)
+
+def get_socket_circle_size(socket, zoom, base_size=5.0):
+    """
+    根据socket类型返回圆圈大小
+    不同数据类型使用不同的显示尺寸，避免全是小圆点
+    """
+    socket_type = get_socket_type_name(socket)
+    # 根据socket类型分配不同的大小系数
+    size_multipliers = {
+        'NodeSocketFloat': 1.0,      # 标准大小
+        'NodeSocketInt': 1.1,        # 略大
+        'NodeSocketVector': 1.15,    # 更大
+        'NodeSocketColor': 1.2,      # 更大
+        'NodeSocketShader': 1.25,    # 最大
+        'NodeSocketBool': 0.9,       # 略小
+        'NodeSocketString': 1.1,
+        'NodeSocketObject': 1.15,
+        'NodeSocketImage': 1.2,
+        'NodeSocketGeometry': 1.25,
+        'NodeSocketCollection': 1.1,
+        'NodeSocketTexture': 1.2,
+        'NodeSocketMaterial': 1.2,
+        'NodeSocketRotation': 1.15,
+        'NodeSocketMatrix': 1.25,
+    }
+    multiplier = size_multipliers.get(socket_type, 1.0)
+    return base_size * multiplier * zoom
+
+def apply_type_based_color_shift(colors, from_socket, to_socket, offset_strength=0.4):
+    """
+    根据socket类型对颜色进行色相偏移
+    offset_strength: 偏移强度（0-1），0.4表示偏移40%的强度，避免颜色变化过大
+    """
+    # 使用目标socket的类型（因为数据流向目标）
+    target_socket = to_socket
+    hue_offset = get_socket_hue_offset(target_socket)
+    
+    # 应用强度系数
+    effective_offset = hue_offset * offset_strength
+    
+    # 对所有颜色应用偏移
+    shifted_colors = []
+    for color in colors:
+        shifted = shift_hue(color, effective_offset)
+        shifted_colors.append(shifted)
+    
+    return shifted_colors
+
+def is_field_link(tree, link):
+    """
+    判断是否为Field(场)数据流连线
+    只在几何节点编辑器中有效
+    """
+    try:
+        if not tree or getattr(tree, 'type', '') != 'GEOMETRY':
+            return False
+        fs = getattr(link, 'from_socket', None)
+        if fs is None:
+            return False
+        
+        # 方法1: 检查socket的is_field属性（Blender 3.0+）
+        if hasattr(fs, 'is_field'):
+            try:
+                field_value = fs.is_field
+                if field_value:
+                    return True
+            except:
+                pass
+        
+        # 方法2: 检查socket的display_shape（Field通常使用DIAMOND形状）
+        if hasattr(fs, 'display_shape'):
+            try:
+                # SOCK_DISPLAY_SHAPE_DIAMOND = 'DIAMOND' 通常表示Field
+                if fs.display_shape == 'DIAMOND':
+                    return True
+            except:
+                pass
+        
+        # 方法3: 通过socket的内部属性判断（使用指针访问）
+        try:
+            # 尝试通过socket的内部结构判断
+            # Blender的socket可能有field相关的内部标志
+            socket_ptr = fs.as_pointer()
+            if socket_ptr:
+                # 在某些Blender版本中，可以通过检查socket的类型标志
+                # 这里我们尝试通过其他方式判断
+                pass
+        except:
+            pass
+        
+        # 方法4: 检查连接的节点类型（某些节点类型通常输出Field）
+        from_node = getattr(link, 'from_node', None)
+        if from_node:
+            # 某些节点类型通常输出Field数据
+            field_output_nodes = [
+                'ATTRIBUTE_DOMAIN', 'FIELD_AT_INDEX', 'SAMPLE_INDEX', 
+                'SAMPLE_NEAREST', 'SAMPLE_NEAREST_SURFACE', 'INTERPOLATE_DOMAIN',
+                'EVALUATE_AT_INDEX', 'EVALUATE_ON_DOMAIN'
+            ]
+            if from_node.type in field_output_nodes:
+                return True
+            
+            # 检查节点名称（某些节点名称包含field相关关键词）
+            node_name_lower = (getattr(from_node, 'name', '') or '').lower()
+            if 'field' in node_name_lower or 'attribute' in node_name_lower:
+                return True
+        
+        # 方法5: 检查目标socket是否接受Field（如果目标socket是Field类型，源也可能是）
+        ts = getattr(link, 'to_socket', None)
+        if ts:
+            if hasattr(ts, 'is_field'):
+                try:
+                    if ts.is_field:
+                        return True
+                except:
+                    pass
+            if hasattr(ts, 'display_shape'):
+                try:
+                    if ts.display_shape == 'DIAMOND':
+                        return True
+                except:
+                    pass
+                    
+    except Exception as e:
+        # 调试用：可以打印错误信息
+        # print(f"Error checking field link: {e}")
+        pass
+    return False
+
+def create_dashed_line_segments_smooth(points, dash_length=10.0, gap_length=5.0, time_offset=0.0):
+    """
+    平滑的虚线生成算法，确保虚线均匀且连续（优化版本）
+    """
+    if len(points) < 2:
+        return []
+    
+    # 预计算累积距离（避免重复计算）
+    cumulative_distances = [0.0]
+    path_length = 0.0
+    for i in range(len(points) - 1):
+        p1 = points[i]
+        p2 = points[i + 1]
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        seg_len = hypot(dx, dy)
+        path_length += seg_len
+        cumulative_distances.append(path_length)
+    
+    if path_length == 0:
+        return []
+    
+    pattern_length = dash_length + gap_length
+    offset = time_offset % pattern_length
+    
+    dashed_segments = []
+    current_pos = -offset
+    max_iterations = int(path_length / min(dash_length, gap_length)) + 10  # 防止无限循环
+    iteration = 0
+    
+    # 沿着路径生成均匀的虚线段（优化版本，限制生成数量）
+    max_segments_limit = 20  # 限制最大虚线段数量，防止性能问题
+    
+    while current_pos < path_length and iteration < max_iterations and len(dashed_segments) < max_segments_limit:
+        iteration += 1
+        pattern_pos = (current_pos + offset + pattern_length) % pattern_length
+        
+        if pattern_pos < dash_length:
+            # 在虚线部分
+            dash_start = current_pos
+            dash_end = min(current_pos + (dash_length - pattern_pos), path_length)
+            
+            if dash_end > dash_start and (dash_end - dash_start) >= 2.0:  # 最小长度限制提高到2像素
+                # 生成虚线段（大幅减少采样点数量，提高性能）
+                segment = []
+                dash_seg_length = dash_end - dash_start
+                # 最小化采样点：每8像素一个采样点，最少2个点，最多4个点
+                num_samples = max(2, min(4, int(dash_seg_length / 8.0)))
+                
+                for j in range(num_samples + 1):
+                    t = j / num_samples if num_samples > 0 else 0
+                    dist = dash_start + (dash_end - dash_start) * t
+                    point = get_point_at_distance(points, cumulative_distances, dist)
+                    if point:
+                        segment.append(point)
+                
+                if len(segment) >= 2:
+                    dashed_segments.append(segment)
+            
+            # 移动到下一个位置（确保有最小步进，防止死循环）
+            current_pos = max(dash_end, current_pos + 1.0)
+            if current_pos >= path_length:
+                break
+        else:
+            # 跳过间隙（确保有最小步进）
+            gap_end = min(current_pos + (pattern_length - pattern_pos), path_length)
+            current_pos = max(gap_end, current_pos + 1.0)
+            if current_pos >= path_length:
+                break
+    
+    return dashed_segments
+
+def create_dashed_line_segments(points, dash_length=10.0, gap_length=5.0, time_offset=0.0):
+    """
+    将连续的点列表转换为虚线段的列表
+    points: 连续的点列表 [(x1, y1), (x2, y2), ...]
+    dash_length: 每段虚线的长度（像素）
+    gap_length: 间隙长度（像素）
+    time_offset: 时间偏移，用于动画效果（像素单位）
+    返回: 虚线段的列表，每个元素是一个点列表
+    """
+    if len(points) < 2:
+        return []
+    
+    # 计算路径上每个点的累积距离
+    cumulative_distances = [0.0]
+    total_length = 0.0
+    
+    for i in range(len(points) - 1):
+        p1 = points[i]
+        p2 = points[i + 1]
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        seg_len = hypot(dx, dy)
+        total_length += seg_len
+        cumulative_distances.append(total_length)
+    
+    if total_length == 0:
+        return []
+    
+    # 虚线模式：dash + gap 循环
+    pattern_length = dash_length + gap_length
+    
+    # 应用时间偏移（循环，确保偏移在有效范围内）
+    offset = time_offset % pattern_length
+    
+    # 沿着路径生成均匀的虚线段
+    dashed_segments = []
+    current_pos = -offset  # 从负偏移开始，这样动画会向前移动
+    
+    # 沿着路径生成虚线段
+    while current_pos < total_length:
+        # 计算当前模式位置（0 到 pattern_length）
+        pattern_pos = (current_pos + offset + pattern_length) % pattern_length
+        
+        # 判断是否在虚线部分
+        if pattern_pos < dash_length:
+            # 计算虚线段的起始和结束位置
+            dash_start = current_pos
+            dash_end = min(current_pos + (dash_length - pattern_pos), total_length)
+            
+            # 如果虚线段长度足够，生成它
+            if dash_end > dash_start:
+                segment_points = []
+                # 沿着虚线段的路径采样点
+                num_samples = max(2, int((dash_end - dash_start) / 2.0))  # 每2像素一个采样点
+                for i in range(num_samples + 1):
+                    t = i / num_samples if num_samples > 0 else 0
+                    dist = dash_start + (dash_end - dash_start) * t
+                    point = get_point_at_distance(points, cumulative_distances, dist)
+                    if point:
+                        segment_points.append(point)
+                
+                if len(segment_points) >= 2:
+                    dashed_segments.append(segment_points)
+            
+            # 移动到虚线段的结束位置
+            current_pos = dash_end
+        else:
+            # 跳过间隙部分
+            gap_start = current_pos
+            gap_end = min(current_pos + (pattern_length - pattern_pos), total_length)
+            current_pos = gap_end
+    
+    return dashed_segments
+
+def get_point_at_path_distance(points, target_distance):
+    """
+    在路径上找到指定距离处的点（直接计算，不需要预计算累积距离）
+    points: 点列表
+    target_distance: 目标距离
+    返回: (x, y) 坐标元组，如果超出范围返回None
+    """
+    if len(points) < 2:
+        return None
+    
+    if target_distance < 0:
+        return points[0]
+    
+    # 沿着路径累加距离，找到目标距离所在的线段
+    current_dist = 0.0
+    for i in range(len(points) - 1):
+        p1 = points[i]
+        p2 = points[i + 1]
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        seg_len = hypot(dx, dy)
+        
+        if current_dist + seg_len >= target_distance:
+            # 在这个线段内
+            if seg_len < 1e-6:
+                return p1
+            
+            t = (target_distance - current_dist) / seg_len
+            x = p1[0] + (p2[0] - p1[0]) * t
+            y = p1[1] + (p2[1] - p1[1]) * t
+            return (x, y)
+        
+        current_dist += seg_len
+    
+    # 超出范围，返回最后一个点
+    return points[-1]
+
+def get_point_at_distance(points, cumulative_distances, target_distance):
+    """
+    在路径上找到指定距离处的点
+    points: 点列表
+    cumulative_distances: 累积距离列表
+    target_distance: 目标距离
+    返回: (x, y) 坐标元组，如果超出范围返回None
+    """
+    if target_distance < 0:
+        target_distance = 0
+    if target_distance >= cumulative_distances[-1]:
+        return points[-1] if points else None
+    
+    # 找到目标距离所在的线段
+    for i in range(len(cumulative_distances) - 1):
+        dist_start = cumulative_distances[i]
+        dist_end = cumulative_distances[i + 1]
+        
+        if dist_start <= target_distance <= dist_end:
+            # 在这个线段内插值
+            if abs(dist_end - dist_start) < 1e-6:
+                return points[i]
+            
+            t = (target_distance - dist_start) / (dist_end - dist_start)
+            p1 = points[i]
+            p2 = points[i + 1]
+            x = p1[0] + (p2[0] - p1[0]) * t
+            y = p1[1] + (p2[1] - p1[1]) * t
+            return (x, y)
+    
+    # 如果没找到，返回最后一个点
+    return points[-1] if points else None
 
 def node_bounds(node, ui_scale):
     """
-    计算节点边界框的 View2D 坐标
+    计算节点边界框的 View2D 坐标（优化版本，用于减少锯齿）
     """
-    ax, ay = node.location.x, node.location.y
-    p = node.parent
-    while p:
-        ax += p.location.x
-        ay += p.location.y
-        p = p.parent
-
-    if node.hide:
-        dpi_fac = bpy.context.preferences.system.dpi / 72
-        magic_w_cloud_value = 9
-        x_min = ax
-        x_max = ax + node.width
-        height = node.dimensions.y / dpi_fac
-        y_min = ay - (height / 2 + magic_w_cloud_value)
-        y_max = ay + (height / 2 - magic_w_cloud_value)
-        x_min *= dpi_fac
-        x_max *= dpi_fac
-        y_min *= dpi_fac
-        y_max *= dpi_fac
+    scale = bpy.context.preferences.system.ui_scale
+    
+    di_x = node.dimensions.x
+    di_y = node.dimensions.y
+    w_cloud_magic_value = 9
+    rara_magic_value = 5
+    
+    if hasattr(node, "location_absolute"):
+        node_x = node.location_absolute.x
+        node_y = node.location_absolute.y
     else:
-        x_min = ax * ui_scale
-        x_max = x_min + node.dimensions.x
-        y_max = ay * ui_scale
-        y_min = y_max - node.dimensions.y
-
+        # 低版本没有location_absolute，使用兼容算法
+        node_x = node.location.x
+        node_y = node.location.y
+        node_p = node.parent
+        while node_p:
+            node_x += node_p.location.x
+            node_y += node_p.location.y
+            node_p = node_p.parent
+    
+    # 当节点类型为中转点时，使用特殊输出
+    if node.type == "REROUTE":
+        x_min = (node_x - rara_magic_value) * scale
+        x_max = (node_x + rara_magic_value) * scale
+        y_min = (node_y - rara_magic_value) * scale
+        y_max = (node_y + rara_magic_value) * scale
+        return x_min, x_max, y_min, y_max
+    
+    x_min = node_x * scale
+    x_max = x_min + di_x
+    
+    if node.hide and node.type not in {"REROUTE", "FRAME"}:
+        y_min = node_y * scale - w_cloud_magic_value * scale - di_y / 2
+        y_max = node_y * scale - w_cloud_magic_value * scale + di_y / 2
+    else:
+        y_min = node_y * scale
+        y_max = y_min - di_y
+    
     return x_min, x_max, y_min, y_max
 
 
@@ -182,18 +618,19 @@ def get_shader(name):
                 float v_side = v_uv.y;
                 float t = u_time * 0.5;
                 
-                // 构建颜色数组
+                // 构建颜色数组（包含RGB和Alpha）
                 vec3 colors[10];
-                colors[0] = color1.rgb;
-                colors[1] = color2.rgb;
-                colors[2] = color3.rgb;
-                colors[3] = color4.rgb;
-                colors[4] = color5.rgb;
-                colors[5] = color6.rgb;
-                colors[6] = color7.rgb;
-                colors[7] = color8.rgb;
-                colors[8] = color9.rgb;
-                colors[9] = color10.rgb;
+                float alphas[10];
+                colors[0] = color1.rgb; alphas[0] = color1.a;
+                colors[1] = color2.rgb; alphas[1] = color2.a;
+                colors[2] = color3.rgb; alphas[2] = color3.a;
+                colors[3] = color4.rgb; alphas[3] = color4.a;
+                colors[4] = color5.rgb; alphas[4] = color5.a;
+                colors[5] = color6.rgb; alphas[5] = color6.a;
+                colors[6] = color7.rgb; alphas[6] = color7.a;
+                colors[7] = color8.rgb; alphas[7] = color8.a;
+                colors[8] = color9.rgb; alphas[8] = color9.a;
+                colors[9] = color10.rgb; alphas[9] = color10.a;
                 
                 // 计算流动相位
                 float flow_speed = 0.5;
@@ -210,7 +647,11 @@ def get_shader(name):
                 index = min(index, u_color_count - 1);
                 int next_index = (index + 1) % u_color_count;
                 
+                // 混合RGB
                 vec3 final_base_rgb = mix(colors[index], colors[next_index], f);
+                
+                // 混合Alpha（每个颜色的独立透明度）
+                float final_base_alpha = mix(alphas[index], alphas[next_index], f);
                 
                 // 脉冲效果
                 float pulse_t = u_time * 1.0;
@@ -227,9 +668,13 @@ def get_shader(name):
                 
                 vec3 final_rgb = min(vec3(1.0), final_base_rgb * boost);
                 
+                // 边缘alpha衰减
                 float dist = abs(v_side);
                 float alpha_edge = 1.0 - smoothstep(0.85, 1.0, dist);
-                fragColor = vec4(final_rgb, u_alpha * alpha_edge);
+                
+                // 最终alpha = 颜色自身alpha * 全局透明度 * 边缘衰减
+                float final_alpha = final_base_alpha * u_alpha * alpha_edge;
+                fragColor = vec4(final_rgb, final_alpha);
             }
         ''')
 
@@ -310,7 +755,8 @@ def _rainbow_rgba(step_t, time_sec):
     r, g, b = colorsys.hsv_to_rgb(hue, saturation * sat_damp, min(1.0, value * boost))
     return (r, g, b, 1.0)
 
-def get_native_link_points(link, v2d, curv):
+def get_native_link_points(link, v2d, curv, zoom_factor=1.0):
+    """获取连线点列表，根据缩放级别优化采样点数"""
     fs, ts = link.from_socket, link.to_socket
     try:
         if not (fs.enabled and ts.enabled):
@@ -328,13 +774,24 @@ def get_native_link_points(link, v2d, curv):
     y1 += y_off
     y2 += y_off
 
+    v2r = v2d.view_to_region
+    
+    # 性能优化：根据缩放级别动态调整采样点数
+    # 缩放级别越低（视图越远），使用越少的采样点
+    if zoom_factor > 0.5:
+        seg = 24  # 高缩放级别：详细采样
+    elif zoom_factor > 0.2:
+        seg = 16  # 中等缩放级别
+    elif zoom_factor > 0.1:
+        seg = 12  # 低缩放级别
+    else:
+        seg = 8   # 极低缩放级别：最少采样
+
     if curv <= 0.001:
         p0 = (x1, y1)
         p3 = (x2, y2)
         p1 = (x1 + (x2 - x1) * (1.0 / 3.0), y1 + (y2 - y1) * (1.0 / 3.0))
         p2 = (x1 + (x2 - x1) * (2.0 / 3.0), y1 + (y2 - y1) * (2.0 / 3.0))
-        v2r = v2d.view_to_region
-        seg = 24
         pts = []
         for i in range(seg + 1):
             t = i / seg
@@ -359,8 +816,6 @@ def get_native_link_points(link, v2d, curv):
     p1 = (x1 + handle_offset, y1)
     p2 = (x2 - handle_offset, y2)
     
-    v2r = v2d.view_to_region
-    seg = 24
     pts = []
     for i in range(seg + 1):
         t = i / seg
@@ -373,6 +828,30 @@ def get_native_link_points(link, v2d, curv):
         y = (inv_t3 * p0[1] + 3 * inv_t2 * t * p1[1] + 3 * inv_t * t2 * p2[1] + t3 * p3[1])
         pts.append(v2r(x, y, clip=False))
     return pts
+
+def _is_link_visible(region, pts, margin=50):
+    """检查连线是否在视口中可见（视口裁剪）"""
+    if not pts or len(pts) < 2:
+        return False
+    
+    # 如果无法获取区域，假设可见
+    if not region:
+        return True
+    
+    view_min_x = 0
+    view_min_y = 0
+    view_max_x = region.width if hasattr(region, 'width') else 1920  # 默认值
+    view_max_y = region.height if hasattr(region, 'height') else 1080  # 默认值
+    
+    # 检查是否有任何点在视口内（带边距）
+    for pt in pts:
+        if pt and len(pt) >= 2:
+            x, y = pt[0], pt[1]
+            if (view_min_x - margin <= x <= view_max_x + margin and 
+                view_min_y - margin <= y <= view_max_y + margin):
+                return True
+    
+    return False
 
 def dpi_fac():
     prefs = bpy.context.preferences.system
@@ -481,7 +960,7 @@ def _get_line_strip_geometry(vertices, width):
         uv_data.append((u, -1.0))
     return pos_data, uv_data
 
-def draw_batch_lines(all_lines_data, shader_name, width, colors=None, time_sec=0.0):
+def draw_batch_lines(all_lines_data, shader_name, width, colors=None, time_sec=0.0, overall_opacity=1.0):
     if not all_lines_data:
         return
 
@@ -512,10 +991,10 @@ def draw_batch_lines(all_lines_data, shader_name, width, colors=None, time_sec=0
     shader.bind()
     if shader_name == 'RAINBOW':
         shader.uniform_float("u_time", time_sec % 1000.0)
-        shader.uniform_float("u_alpha", 1.0)
+        shader.uniform_float("u_alpha", overall_opacity)
     elif shader_name == 'GRADIENT':
         shader.uniform_float("u_time", time_sec % 1000.0)
-        shader.uniform_float("u_alpha", 1.0)
+        shader.uniform_float("u_alpha", overall_opacity)
         
         # 获取颜色数量和颜色列表
         color_count = len(colors) if colors else 0
@@ -525,24 +1004,34 @@ def draw_batch_lines(all_lines_data, shader_name, width, colors=None, time_sec=0
             colors = [(0.0, 0.5, 1.0, 1.0), (0.0, 1.0, 0.8, 1.0), (1.0, 1.0, 0.0, 1.0),
                       (1.0, 0.5, 0.0, 1.0), (1.0, 0.0, 0.5, 1.0)]
         
+        # 应用全局透明度到每个颜色的alpha值
+        # 每个颜色已经有自己的alpha值，现在再乘以全局透明度
+        colors = [(c[0], c[1], c[2], (c[3] * overall_opacity) if len(c) > 3 else overall_opacity) for c in colors]
+        
         # 设置颜色数量
         shader.uniform_int("u_color_count", color_count)
         
         # 传入最多10个颜色（不足的用最后一个颜色填充）
         color_list = list(colors[:color_count])
         while len(color_list) < 10:
-            color_list.append(color_list[-1] if color_list else (1.0, 1.0, 1.0, 1.0))
+            color_list.append(color_list[-1] if color_list else (1.0, 1.0, 1.0, overall_opacity))
         
         for i in range(10):
             shader.uniform_float(f"color{i+1}", color_list[i])
     elif shader_name == 'SMOOTH_COLOR':
         if colors and len(colors) >= 1:
-            shader.uniform_float("color", colors[0])
+            # 应用透明度
+            color = colors[0]
+            if len(color) >= 4:
+                color = (color[0], color[1], color[2], color[3] * overall_opacity)
+            else:
+                color = (*color[:3], overall_opacity)
+            shader.uniform_float("color", color)
     
     batch = batch_for_shader(shader, 'TRI_STRIP', {"pos": all_pos, "uv": all_uv})
     batch.draw(shader)
 
-def draw_batch_circles(batch_circles, radius, color):
+def draw_batch_circles(batch_circles, radius, color, overall_opacity=1.0):
     if not batch_circles or radius <= 0:
         return
     shader = get_shader('SDF_CIRCLE')
@@ -571,10 +1060,16 @@ def draw_batch_circles(batch_circles, radius, color):
         all_uv.extend([u0, u2, u1])
         all_pos.extend([p1, p2, p3])
         all_uv.extend([u1, u2, u3])
+    
+    # 应用透明度到颜色
+    if len(color) >= 4:
+        adjusted_color = (color[0], color[1], color[2], color[3] * overall_opacity)
+    else:
+        adjusted_color = (*color[:3], overall_opacity)
         
     batch = batch_for_shader(shader, 'TRIS', {"pos": all_pos, "uv": all_uv})
     shader.bind()
-    shader.uniform_float("color", color)
+    shader.uniform_float("color", adjusted_color)
     gpu.state.blend_set('ALPHA')
     batch.draw(shader)
     gpu.state.blend_set('NONE')
@@ -584,18 +1079,24 @@ def get_panel_settings():
         scene = bpy.context.scene
         if hasattr(scene, 'colorful_connections_settings'):
             settings = scene.colorful_connections_settings
-            # 辅助函数：转为RGBA
+            # 辅助函数：转为RGBA（支持从PropertyGroup读取alpha）
             def to_rgba(c):
+                alpha = 1.0
+                if hasattr(c, 'alpha'):
+                    alpha = float(c.alpha)
+                
                 if isinstance(c, (list, tuple)):
-                    if len(c) >= 3:
-                        return (float(c[0]), float(c[1]), float(c[2]), 1.0)
+                    if len(c) >= 4:
+                        return (float(c[0]), float(c[1]), float(c[2]), float(c[3]))
+                    elif len(c) >= 3:
+                        return (float(c[0]), float(c[1]), float(c[2]), alpha)
                 # 如果是 PropertyGroup 的属性
                 if hasattr(c, 'color'):
                     col = c.color
-                    return (float(col[0]), float(col[1]), float(col[2]), 1.0)
-                return (1.0, 1.0, 1.0, 1.0)
+                    return (float(col[0]), float(col[1]), float(col[2]), alpha)
+                return (1.0, 1.0, 1.0, alpha)
             
-            # 从新的颜色集合中读取
+            # 从新的颜色集合中读取（Constant类型）
             gradient_colors = []
             color_count = getattr(settings, 'gradient_color_count', 5)
             colors = getattr(settings, 'gradient_colors', None)
@@ -615,6 +1116,55 @@ def get_panel_settings():
                     (1.0, 0.0, 0.5, 1.0)
                 ]
             
+            # 从新的颜色集合中读取（Field类型）
+            field_gradient_colors = []
+            field_color_count = getattr(settings, 'field_gradient_color_count', 5)
+            field_colors = getattr(settings, 'field_gradient_colors', None)
+            
+            if field_colors and len(field_colors) > 0:
+                # 只读取实际使用的颜色数量
+                for i in range(min(field_color_count, len(field_colors))):
+                    field_gradient_colors.append(to_rgba(field_colors[i]))
+            
+            # 如果Field颜色不足，使用默认值（紫色系）
+            if len(field_gradient_colors) < 2:
+                field_gradient_colors = [
+                    (0.8, 0.2, 1.0, 1.0),
+                    (0.6, 0.4, 1.0, 1.0),
+                    (1.0, 0.4, 0.8, 1.0),
+                    (0.9, 0.6, 1.0, 1.0),
+                    (0.7, 0.3, 0.9, 1.0)
+                ]
+            
+            # 读取底层背景颜色（新格式：RGB和Alpha分开，兼容旧格式）
+            backing_color_rgba = (0.0, 0.0, 0.0, 0.55)  # 默认值
+            try:
+                # 优先尝试新格式（RGB和Alpha分开）
+                # 直接尝试读取，不使用hasattr，因为PropertyGroup的属性应该总是存在
+                try:
+                    rgb = settings.backing_color_rgb
+                    alpha = settings.backing_color_alpha
+                    # 处理Blender的Vector类型，转换为tuple
+                    if hasattr(rgb, '__len__') and len(rgb) >= 3:
+                        backing_color_rgba = (float(rgb[0]), float(rgb[1]), float(rgb[2]), float(alpha))
+                    elif isinstance(rgb, (list, tuple)) and len(rgb) >= 3:
+                        backing_color_rgba = (float(rgb[0]), float(rgb[1]), float(rgb[2]), float(alpha))
+                except AttributeError:
+                    # 如果新属性不存在，尝试旧格式（RGBA向量）
+                    try:
+                        backing_color = settings.backing_color
+                        if hasattr(backing_color, '__len__') and len(backing_color) >= 4:
+                            backing_color_rgba = (float(backing_color[0]), float(backing_color[1]), float(backing_color[2]), float(backing_color[3]))
+                        elif isinstance(backing_color, (list, tuple)) and len(backing_color) >= 4:
+                            backing_color_rgba = (float(backing_color[0]), float(backing_color[1]), float(backing_color[2]), float(backing_color[3]))
+                    except AttributeError:
+                        pass  # 使用默认值
+            except Exception as e:
+                print(f"读取底层背景颜色时出错: {e}")
+                import traceback
+                traceback.print_exc()
+                backing_color_rgba = (0.0, 0.0, 0.0, 0.55)
+            
             return {
                 'animation_speed': settings.animation_speed,
                 'line_thickness': settings.line_thickness,
@@ -624,7 +1174,11 @@ def get_panel_settings():
                 'trace_mode': getattr(settings, 'trace_mode', 'ALL_SELECTED'),
                 'flow_direction': getattr(settings, 'flow_direction', 'DOWNSTREAM'),
                 'lock_flow': getattr(settings, 'lock_flow', False),
-                'gradient_colors': gradient_colors
+                'enable_type_based_colors': getattr(settings, 'enable_type_based_colors', False),
+                'overall_opacity': getattr(settings, 'overall_opacity', 1.0),
+                'backing_color': backing_color_rgba,
+                'gradient_colors': gradient_colors,
+                'field_gradient_colors': field_gradient_colors
             }
         else:
             # 默认值
@@ -633,16 +1187,26 @@ def get_panel_settings():
                 'line_thickness': 2.0,
                 'node_border_thickness': 3.0,
                 'enable_colorful_connections': True,
-                'connection_color_type': 'RAINBOW',
+                'connection_color_type': 'CUSTOM',
                 'trace_mode': 'ALL_SELECTED',
                 'flow_direction': 'DOWNSTREAM',
                 'lock_flow': False,
+                'enable_type_based_colors': False,
+                'overall_opacity': 1.0,
+                'backing_color': (0.0, 0.0, 0.0, 0.55),  # 默认值，格式：(R, G, B, A)
                 'gradient_colors': [
                     (0.0, 0.5, 1.0, 1.0),
                     (0.0, 1.0, 0.8, 1.0),
                     (1.0, 1.0, 0.0, 1.0),
                     (1.0, 0.5, 0.0, 1.0),
                     (1.0, 0.0, 0.5, 1.0)
+                ],
+                'field_gradient_colors': [
+                    (0.8, 0.2, 1.0, 1.0),
+                    (0.6, 0.4, 1.0, 1.0),
+                    (1.0, 0.4, 0.8, 1.0),
+                    (0.9, 0.6, 1.0, 1.0),
+                    (0.7, 0.3, 0.9, 1.0)
                 ]
             }
     except Exception as e:
@@ -653,10 +1217,11 @@ def get_panel_settings():
             'line_thickness': 2.0,
             'node_border_thickness': 3.0,
             'enable_colorful_connections': True,
-            'connection_color_type': 'RAINBOW',
+            'connection_color_type': 'CUSTOM',
             'trace_mode': 'ALL_SELECTED',
             'flow_direction': 'DOWNSTREAM',
             'lock_flow': False,
+            'enable_type_based_colors': False,
             'gradient_colors': [
                 (0.0, 0.5, 1.0, 1.0),
                 (0.0, 1.0, 0.8, 1.0),
@@ -831,9 +1396,11 @@ def draw_colorful_connections():
     zoom = _view2d_zoom_factor(v2d)
     
     time_sec = time.time() * settings.get('animation_speed', 1.0)
-    connection_color_type = settings.get('connection_color_type', 'RAINBOW')
+    connection_color_type = settings.get('connection_color_type', 'CUSTOM')
+    overall_opacity = settings.get('overall_opacity', 1.0)
     
     grad_cols = settings.get('gradient_colors', [])
+    field_grad_cols = settings.get('field_gradient_colors', [])
 
     batch_lines_backing = []
     batch_lines_main = []
@@ -861,6 +1428,10 @@ def draw_colorful_connections():
 
     socket_index_cache = {}
     curv_factor = get_curving_factor()
+    enable_type_colors = settings.get('enable_type_based_colors', False)
+    
+    # 存储每条连线的信息，用于后续绘制
+    link_info_list = []
 
     for link in links_to_draw:
         fs = getattr(link, "from_socket", None)
@@ -881,55 +1452,206 @@ def draw_colorful_connections():
         except:
             continue
 
-        pts = get_native_link_points(link, v2d, curv_factor)
+        # 性能优化：根据缩放级别调整采样点数
+        pts = get_native_link_points(link, v2d, curv_factor, zoom)
         if not pts or len(pts) < 2:
             continue
-        batch_lines_backing.append(pts)
-        batch_lines_main.append(pts)
-        sx, sy = pts[0]
-        tx, ty = pts[-1]
-        batch_circles_backing.append((sx, sy))
-        batch_circles_backing.append((tx, ty))
-        batch_circles_start.append((sx, sy))
-        batch_circles_end.append((tx, ty))
+        
+        # 性能优化：视口裁剪，跳过不可见的连线
+        try:
+            region = context.region
+            if not _is_link_visible(region, pts, margin=100):
+                continue
+        except:
+            # 如果无法获取 region，继续绘制（向后兼容）
+            pass
+        
+        # 保存连线信息和socket信息
+        is_field = is_field_link(tree, link)
+        link_info_list.append({
+            'pts': pts,
+            'from_socket': fs,
+            'to_socket': ts,
+            'start_pos': (pts[0][0], pts[0][1]),
+            'end_pos': (pts[-1][0], pts[-1][1]),
+            'is_field': is_field,
+            'link': link  # 保存link引用以便后续使用
+        })
 
+    # 分离Field和Constant连线
+    field_links = []
+    constant_links = []
+    
+    for link_info in link_info_list:
+        if link_info.get('is_field', False):
+            field_links.append(link_info)
+        else:
+            constant_links.append(link_info)
+    
     width_backing = max(2.0, 9.0 * zoom)
     width_main = max(1.5, settings.get('line_thickness', 2.0) * zoom)
 
-    # 1. Backing (Black outline)
-    draw_batch_lines(batch_lines_backing, 'SMOOTH_COLOR', width_backing, colors=[(0, 0, 0, 0.55)])
+    # 1. Backing (底层背景) - 给所有连线画背景
+    all_backing = [info['pts'] for info in link_info_list]
+    if all_backing:
+        # 从设置中获取底层背景颜色（draw_batch_lines会自动应用overall_opacity）
+        backing_color_setting = settings.get('backing_color', (0.0, 0.0, 0.0, 0.55))
+        # 确保是RGBA格式的tuple，并确保所有值都是float
+        if isinstance(backing_color_setting, (list, tuple)) and len(backing_color_setting) >= 4:
+            backing_color = (
+                float(backing_color_setting[0]),
+                float(backing_color_setting[1]),
+                float(backing_color_setting[2]),
+                float(backing_color_setting[3])
+            )
+        else:
+            backing_color = (0.0, 0.0, 0.0, 0.55)
+        
+        # 调试：打印颜色值（可以注释掉）
+        # print(f"底层背景颜色: {backing_color}, 整体透明度: {overall_opacity}")
+        
+        draw_batch_lines(all_backing, 'SMOOTH_COLOR', width_backing, colors=[backing_color], overall_opacity=overall_opacity)
 
-    # 2. Main Lines
-    if connection_color_type == 'RAINBOW':
-        draw_batch_lines(batch_lines_main, 'RAINBOW', width_main, time_sec=time_sec)
+    # 2. Main Lines - Constant连线：实线流动
+    if constant_links:
+        if enable_type_colors:
+            # 性能优化：按socket类型分组，批量绘制相同类型的连线
+            links_by_socket_type = {}
+            for link_info in constant_links:
+                ts = link_info['to_socket']
+                socket_type = get_socket_type_name(ts)
+                if socket_type not in links_by_socket_type:
+                    links_by_socket_type[socket_type] = []
+                links_by_socket_type[socket_type].append(link_info)
+            
+            # 为每种socket类型批量绘制
+            for socket_type, type_links in links_by_socket_type.items():
+                if not type_links:
+                    continue
+                # 获取该类型的颜色偏移
+                sample_link = type_links[0]
+                ts = sample_link['to_socket']
+                link_colors = apply_type_based_color_shift(grad_cols, sample_link['from_socket'], ts, offset_strength=0.5)
+                # 批量绘制所有相同类型的连线
+                type_points = [info['pts'] for info in type_links]
+                draw_batch_lines(type_points, 'GRADIENT', width_main, colors=link_colors, time_sec=time_sec, overall_opacity=overall_opacity)
+        else:
+            # 所有连线使用相同颜色
+            constant_main = [info['pts'] for info in constant_links]
+            draw_batch_lines(constant_main, 'GRADIENT', width_main, colors=grad_cols, time_sec=time_sec, overall_opacity=overall_opacity)
+    
+    # 3. Field连线：使用Field配色方案（实线，不再使用虚线）
+    if field_links:
+        if enable_type_colors:
+            # 性能优化：按socket类型分组，批量绘制相同类型的连线
+            field_links_by_socket_type = {}
+            for field_info in field_links:
+                ts = field_info['to_socket']
+                socket_type = get_socket_type_name(ts)
+                if socket_type not in field_links_by_socket_type:
+                    field_links_by_socket_type[socket_type] = []
+                field_links_by_socket_type[socket_type].append(field_info)
+            
+            # 为每种socket类型批量绘制
+            for socket_type, type_links in field_links_by_socket_type.items():
+                if not type_links:
+                    continue
+                # 获取该类型的颜色偏移
+                sample_link = type_links[0]
+                ts = sample_link['to_socket']
+                link_colors = apply_type_based_color_shift(field_grad_cols, sample_link['from_socket'], ts, offset_strength=0.5)
+                # 批量绘制所有相同类型的连线
+                type_points = [info['pts'] for info in type_links]
+                draw_batch_lines(type_points, 'GRADIENT', width_main, colors=link_colors, time_sec=time_sec, overall_opacity=overall_opacity)
+        else:
+            # 所有Field连线使用Field配色方案
+            field_main = [info['pts'] for info in field_links]
+            draw_batch_lines(field_main, 'GRADIENT', width_main, colors=field_grad_cols, time_sec=time_sec, overall_opacity=overall_opacity)
+
+    # 3. Circles - 背景圆圈（给所有连线）
+    all_circles_backing = []
+    for info in link_info_list:
+        all_circles_backing.append(info['start_pos'])
+        all_circles_backing.append(info['end_pos'])
+    if all_circles_backing:
+        backing_circle_color = (0, 0, 0, 0.55 * overall_opacity)
+        draw_batch_circles(all_circles_backing, 7.0 * zoom, backing_circle_color, overall_opacity=overall_opacity)
+
+    # 端点圆圈 - 根据连线类型（Constant或Field）显示不同颜色
+    if enable_type_colors:
+        # 性能优化：按颜色和大小分组，批量绘制端点圆圈
+        circles_by_key = {}  # key: (color_tuple, size) -> list of positions
+        for link_info in link_info_list:
+            ts = link_info['to_socket']
+            sx, sy = link_info['start_pos']
+            tx, ty = link_info['end_pos']
+            is_field = link_info.get('is_field', False)
+            
+            # 根据连线类型选择颜色方案
+            base_cols = field_grad_cols if is_field else grad_cols
+            
+            # 起始端点
+            socket_color_start = apply_type_based_color_shift([base_cols[0] if base_cols else (1,1,1,1)], None, ts, offset_strength=0.5)[0]
+            socket_size_start = get_socket_circle_size(ts, zoom)
+            start_key = (socket_color_start, socket_size_start)
+            if start_key not in circles_by_key:
+                circles_by_key[start_key] = []
+            circles_by_key[start_key].append((sx, sy))
+            
+            # 结束端点
+            socket_color_end = apply_type_based_color_shift([base_cols[-1] if base_cols else (1,1,1,1)], None, ts, offset_strength=0.5)[0]
+            socket_size_end = get_socket_circle_size(ts, zoom)
+            end_key = (socket_color_end, socket_size_end)
+            if end_key not in circles_by_key:
+                circles_by_key[end_key] = []
+            circles_by_key[end_key].append((tx, ty))
+        
+        # 批量绘制所有相同颜色和大小的圆圈
+        for (color, size), positions in circles_by_key.items():
+            if positions:
+                draw_batch_circles(positions, size, color, overall_opacity=overall_opacity)
     else:
-        # 使用 GRADIENT 着色器，传入5个颜色
-        draw_batch_lines(batch_lines_main, 'GRADIENT', width_main, colors=grad_cols, time_sec=time_sec)
-
-    # 3. Circles
-    draw_batch_circles(batch_circles_backing, 7.0 * zoom, (0, 0, 0, 0.55))
-
-    if connection_color_type == 'RAINBOW':
-        draw_batch_circles(batch_circles_start, 5.0 * zoom, _rainbow_rgba(0.0, time_sec))
-        draw_batch_circles(batch_circles_end, 5.0 * zoom, _rainbow_rgba(1.0, time_sec))
-    else:
-        # 自定义模式下，端点颜色动态取色
-        c_start = grad_cols[0] if grad_cols else (1,1,1,1)
-        # 终点使用最后一个颜色
-        c_end = grad_cols[-1] if grad_cols else c_start
-        draw_batch_circles(batch_circles_start, 5.0 * zoom, c_start) 
-        draw_batch_circles(batch_circles_end, 5.0 * zoom, c_end)
+        # 根据连线类型使用不同的颜色方案
+        constant_start_positions = [info['start_pos'] for info in constant_links]
+        constant_end_positions = [info['end_pos'] for info in constant_links]
+        field_start_positions = [info['start_pos'] for info in field_links]
+        field_end_positions = [info['end_pos'] for info in field_links]
+        
+        # Constant连线端点
+        if constant_start_positions or constant_end_positions:
+            c_start = grad_cols[0] if grad_cols else (1,1,1,1)
+            c_end = grad_cols[-1] if grad_cols else c_start
+            if constant_start_positions:
+                draw_batch_circles(constant_start_positions, 5.0 * zoom, c_start, overall_opacity=overall_opacity)
+            if constant_end_positions:
+                draw_batch_circles(constant_end_positions, 5.0 * zoom, c_end, overall_opacity=overall_opacity)
+        
+        # Field连线端点
+        if field_start_positions or field_end_positions:
+            f_start = field_grad_cols[0] if field_grad_cols else (0.8, 0.2, 1.0, 1.0)
+            f_end = field_grad_cols[-1] if field_grad_cols else f_start
+            if field_start_positions:
+                draw_batch_circles(field_start_positions, 5.0 * zoom, f_start, overall_opacity=overall_opacity)
+            if field_end_positions:
+                draw_batch_circles(field_end_positions, 5.0 * zoom, f_end, overall_opacity=overall_opacity)
 
     # 4. Node Borders
     if batch_node_bbox:
-        if connection_color_type == 'RAINBOW':
-            draw_batch_lines(batch_node_bbox, 'RAINBOW', bbox_width, time_sec=time_sec)
-        else:
-            draw_batch_lines(batch_node_bbox, 'GRADIENT', bbox_width, colors=grad_cols, time_sec=time_sec)
+        draw_batch_lines(batch_node_bbox, 'GRADIENT', bbox_width, colors=grad_cols, time_sec=time_sec, overall_opacity=overall_opacity)
 
     gpu.state.blend_set('NONE')
+    # 性能优化：根据连线数量动态调整重绘频率
+    # 连线数量多时，降低刷新频率以减少GPU负载
+    num_links = len(links_to_draw)
+    if num_links > 500:
+        redraw_interval = 0.2  # 大量连线时，每0.2秒刷新一次
+    elif num_links > 200:
+        redraw_interval = 0.15  # 中等数量连线
+    else:
+        redraw_interval = 0.1  # 少量连线，正常刷新频率
+    
     if not bpy.app.timers.is_registered(force_redraw):
-        bpy.app.timers.register(force_redraw, first_interval=0.01)
+        bpy.app.timers.register(force_redraw, first_interval=redraw_interval)
 
 def force_redraw():
     try:
@@ -943,13 +1665,17 @@ def force_redraw():
     return None
 
 def register():
-    global draw_handler
+    global draw_handler, _SHADER_CACHE
+    # 清除着色器缓存，确保使用最新的着色器代码（包括alpha支持）
+    _SHADER_CACHE.clear()
     draw_handler = bpy.types.SpaceNodeEditor.draw_handler_add(
         draw_colorful_connections, (), 'WINDOW', 'POST_PIXEL'
     )
 
 def unregister():
-    global draw_handler
+    global draw_handler, _SHADER_CACHE
     if draw_handler:
         bpy.types.SpaceNodeEditor.draw_handler_remove(draw_handler, 'WINDOW')
         draw_handler = None
+    # 清除着色器缓存
+    _SHADER_CACHE.clear()
