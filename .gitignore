@@ -1,3 +1,6 @@
+# 想保留在本地,不推送到远程的 文件名 和 文件夹名 可以写在这里,这需要推送到远程
+# 也可以写在: .git\info\exclude,  这保留在本地
+
 .history/
 __pycache__
 .yapf
@@ -5,3 +8,4 @@ __pycache__
 desktop.ini
 .*/                   # 所有 .开头的文件夹
 nul
+**.zip
